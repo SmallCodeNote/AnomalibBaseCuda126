@@ -3,7 +3,9 @@ import json
 import glob
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
+
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import numpy as np
 import onnxruntime as ort
@@ -27,6 +29,8 @@ def load_config():
     return {
         "onnx_path": "patchcore.onnx",
         "image_dir": "",
+        "heatmap_min": 0.0,
+        "heatmap_max": 1.0,
     }
 
 
@@ -53,14 +57,20 @@ def preprocess_image(path, size=256):
     return img, arr
 
 
-def apply_heatmap(anomaly_map, original_img):
+def apply_heatmap(anomaly_map, original_img, vmin, vmax):
+    #anomaly_map = anomaly_map / anomaly_map.max()
+    print(anomaly_map.max())
     anomaly_map = anomaly_map.squeeze()
-    anomaly_map = anomaly_map / anomaly_map.max()
-    anomaly_map = cm.jet(anomaly_map)[:, :, :3]  # RGB
+
+    # --- カラースケール固定 ---
+    anomaly_map = np.clip((anomaly_map - vmin) / (vmax - vmin), 0, 1)
+
+    anomaly_map = cm.jet(anomaly_map)[:, :, :3]
     anomaly_map = (anomaly_map * 255).astype(np.uint8)
     anomaly_map = Image.fromarray(anomaly_map).resize(original_img.size)
     blended = Image.blend(original_img, anomaly_map, alpha=0.5)
     return blended
+
 
 
 # ============================================================
@@ -76,10 +86,17 @@ class PatchcoreInferGUI:
         self.onnx_var = tk.StringVar(value=self.cfg["onnx_path"])
         self.image_dir_var = tk.StringVar(value=self.cfg["image_dir"])
 
+        self.session = None
+        
+        self.heatmap_min_var = tk.DoubleVar(value=self.cfg.get("heatmap_min", 0.0))
+        self.heatmap_max_var = tk.DoubleVar(value=self.cfg.get("heatmap_max", 1.0))
+
+
         self.build_ui()
 
-        self.session = None
-
+    # --------------------------------------------------------
+    # UI
+    # --------------------------------------------------------
     def build_ui(self):
         row = 0
 
@@ -98,9 +115,36 @@ class PatchcoreInferGUI:
 
         tk.Button(self.root, text="Start Predict", command=self.run_inference, width=20).grid(row=row, column=1, pady=10)
 
-        self.canvas = tk.Canvas(self.root, width=600, height=300)
-        self.canvas.grid(row=row + 1, column=0, columnspan=3)
+        # --- Score Label ---
+        self.score_label = tk.Label(self.root, text="Score: ---", font=("Arial", 12))
+        self.score_label.grid(row=row + 1, column=1)
 
+        # --- File Path Label ---
+        self.path_label = tk.Label(self.root, text="File: ---", font=("Arial", 10))
+        self.path_label.grid(row=row + 2, column=1)
+
+        # --- Canvas ---
+        self.canvas = tk.Canvas(self.root, width=600, height=300, bg="gray")
+        self.canvas.grid(row=row + 3, column=0, columnspan=3, pady=10)
+
+        # --- Drag & Drop (tkinterDnD2) ---
+        self.canvas.drop_target_register(DND_FILES)
+        self.canvas.dnd_bind("<<Drop>>", self.on_drop)
+
+        # --- Heatmap Min ---
+        tk.Label(self.root, text="Heatmap Min").grid(row=row+4, column=0, sticky="w")
+        tk.Scale(self.root, variable=self.heatmap_min_var, from_=0.0, to=100.0,
+                resolution=0.01, orient="horizontal", length=200).grid(row=row+4, column=1)
+
+        # --- Heatmap Max ---
+        tk.Label(self.root, text="Heatmap Max").grid(row=row+5, column=0, sticky="w")
+        tk.Scale(self.root, variable=self.heatmap_max_var, from_=0.0, to=100.0,
+                resolution=0.01, orient="horizontal", length=200).grid(row=row+5, column=1)
+
+
+    # --------------------------------------------------------
+    # File Select
+    # --------------------------------------------------------
     def select_file(self, var):
         path = filedialog.askopenfilename()
         if path:
@@ -111,21 +155,17 @@ class PatchcoreInferGUI:
         if path:
             var.set(path)
 
+    # --------------------------------------------------------
+    # ONNX Load
+    # --------------------------------------------------------
     def load_onnx(self):
         onnx_path = self.onnx_var.get().strip()
         onnx_path = os.path.abspath(onnx_path)
-    
-        if not os.path.exists(onnx_path):
-            messagebox.showerror("ERROR", f"ONNX file not found.\n{onnx_path}")
-            return False
-    
-        # .data file check
-        data_path = onnx_path + ".data"
-        if not os.path.exists(data_path):
-            messagebox.showwarning("Worning", f" .data file notfound.\n{data_path}")
 
-        print("[ONNX] Loading from path:", onnx_path)
-    
+        if not os.path.exists(onnx_path):
+            self.score_label.config(text="ONNX file not found")
+            return False
+
         try:
             self.session = ort.InferenceSession(
                 onnx_path,
@@ -134,32 +174,25 @@ class PatchcoreInferGUI:
             return True
         except Exception as e:
             traceback.print_exc()
-            messagebox.showerror("ONNX Load Error", str(e))
-        return False
+            self.score_label.config(text=f"ONNX Load Error: {e}")
+            return False
 
+    # --------------------------------------------------------
+    # Drag & Drop handler
+    # --------------------------------------------------------
+    def on_drop(self, event):
+        path = event.data.strip("{}")
+        if os.path.isfile(path):
+            self.predict_single_image(path)
 
-    def run_inference(self):
+    # --------------------------------------------------------
+    # Predict for one image
+    # --------------------------------------------------------
+    def predict_single_image(self, img_path):
         try:
-            # JSON Config Save
-            cfg = {
-                "onnx_path": self.onnx_var.get(),
-                "image_dir": self.image_dir_var.get(),
-            }
-            save_config(cfg)
-
-            if not self.load_onnx():
-                return
-
-            image_dir = self.image_dir_var.get()
-            files = sorted(glob.glob(os.path.join(image_dir, "*.*")))
-
-            if not files:
-                messagebox.showerror("Error", "Image file not found.")
-                return
-
-            # Prediction
-            img_path = files[0]
-            print("[Infer] Image:", img_path)
+            if not self.session:
+                if not self.load_onnx():
+                    return
 
             original_img, arr = preprocess_image(img_path)
 
@@ -171,31 +204,60 @@ class PatchcoreInferGUI:
             anomaly_map = anomaly_map[0]
             score = float(score[0])
 
-            print("[Infer] Score:", score)
+            vmin = self.heatmap_min_var.get()
+            vmax = self.heatmap_max_var.get()
 
-            heatmap_img = apply_heatmap(anomaly_map, original_img)
+            heatmap_img = apply_heatmap(anomaly_map, original_img, vmin, vmax)
+
 
             # Tkinter view
             original_tk = ImageTk.PhotoImage(original_img.resize((300, 300)))
             heatmap_tk = ImageTk.PhotoImage(heatmap_img.resize((300, 300)))
 
+            self.canvas.delete("all")
             self.canvas.create_image(0, 0, anchor="nw", image=original_tk)
             self.canvas.create_image(300, 0, anchor="nw", image=heatmap_tk)
 
             self.original_tk = original_tk
             self.heatmap_tk = heatmap_tk
 
-            messagebox.showinfo("Complete", f"Score: {score:.4f}")
+            # Update labels
+            self.score_label.config(text=f"Score: {score:.4f}")
+            self.path_label.config(text=f"File: {img_path}")
 
         except Exception as e:
             traceback.print_exc()
-            messagebox.showerror("Error", str(e))
+            self.score_label.config(text=f"Error: {e}")
+
+    # --------------------------------------------------------
+    # Predict first image in directory
+    # --------------------------------------------------------
+    def run_inference(self):
+        cfg = {
+            "onnx_path": self.onnx_var.get(),
+            "image_dir": self.image_dir_var.get(),
+            "heatmap_min": self.heatmap_min_var.get(),
+            "heatmap_max": self.heatmap_max_var.get(),
+        }
+        save_config(cfg)
+
+        if not self.load_onnx():
+            return
+
+        image_dir = self.image_dir_var.get()
+        files = sorted(glob.glob(os.path.join(image_dir, "*.*")))
+
+        if not files:
+            self.score_label.config(text="No image found")
+            return
+
+        self.predict_single_image(files[0])
 
 
 # ============================================================
 # Main
 # ============================================================
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = TkinterDnD.Tk()  # ★ ここが重要（DnD対応）
     app = PatchcoreInferGUI(root)
     root.mainloop()
