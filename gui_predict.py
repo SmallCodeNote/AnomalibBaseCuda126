@@ -233,6 +233,7 @@ class PatchcoreInferGUI:
     # Predict first image in directory
     # --------------------------------------------------------
     def run_inference(self):
+        # --- Save config ---
         cfg = {
             "onnx_path": self.onnx_var.get(),
             "image_dir": self.image_dir_var.get(),
@@ -241,17 +242,73 @@ class PatchcoreInferGUI:
         }
         save_config(cfg)
 
+        # --- Load ONNX ---
         if not self.load_onnx():
             return
 
-        image_dir = self.image_dir_var.get()
-        files = sorted(glob.glob(os.path.join(image_dir, "*.*")))
+        image_dir = self.image_dir_var.get().strip()
+        if not os.path.isdir(image_dir):
+            self.score_label.config(text="Invalid image directory")
+            return
 
+        # --- Get Files ---
+        files = sorted(glob.glob(os.path.join(image_dir, "*.*")))
         if not files:
             self.score_label.config(text="No image found")
             return
 
-        self.predict_single_image(files[0])
+        # --- SaveFileDialog ---
+        save_path = filedialog.asksaveasfilename(
+            initialdir=image_dir,
+            initialfile="result.txt",
+            defaultextension=".txt",
+            filetypes=[("Text Files", "*.txt")]
+        )
+
+        if not save_path:
+            self.score_label.config(text="Save canceled")
+            return
+
+        # --- Prediction Loop ---
+        vmin = self.heatmap_min_var.get()
+        vmax = self.heatmap_max_var.get()
+
+        total = len(files)
+        done = 0
+
+        try:
+            with open(save_path, "w", encoding="utf-8") as f:
+                for img_path in files:
+                    try:
+                        original_img, arr = preprocess_image(img_path)
+
+                        anomaly_map, score = self.session.run(
+                            ["anomaly_map", "anomaly_score"],
+                            {"input": arr},
+                        )
+
+                        score = float(score[0])
+
+                        # --- Write Result ---
+                        fname = os.path.basename(img_path)
+                        f.write(f"{fname}\t{score:.6f}\n")
+
+                    except Exception:
+                        traceback.print_exc()
+                        fname = os.path.basename(img_path)
+                        f.write(f"{fname}\tERROR\n")
+
+                    # --- Progress Upadte ---
+                    done += 1
+                    self.path_label.config(text=f"Progress: {done} / {total} files")
+                    self.root.update_idletasks()
+
+            self.score_label.config(text=f"Saved: {save_path}")
+            self.path_label.config(text=f"Completed: {total} files")
+
+        except Exception as e:
+            traceback.print_exc()
+            self.score_label.config(text=f"Error: {e}")
 
 
 # ============================================================
